@@ -1,34 +1,32 @@
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
-    net::{
-        TcpListener, TcpStream,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
+    io::{AsyncReadExt, AsyncWriteExt, AsyncRead, AsyncWrite, split}, net::TcpListener
 };
+use tokio_socks::tcp::Socks5Stream;
+use anyhow::Result; 
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:7878").await?;
     println!("Server started");
 
     loop {
-        let (mut stream, socket) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         println!("connected");
 
-        let client = TcpStream::connect("127.0.0.1:1080").await?;
+        let client = Socks5Stream::connect("127.0.0.1:1080", "127.0.0.1:1088").await?;
         println!("client connected");
 
-        let (client_read, client_write) = client.into_split();
-        let (stream_read, stream_write) = stream.into_split();
+        let (client_read, client_write) = split(client);
+        let (stream_read, stream_write) = split(stream);
 
-        let a = async {
-            read_to_write(client_read, stream_write, "read".to_string())
+        let a = async move {
+            read_to_write(client_read, stream_write)
                 .await
                 .unwrap();
         };
 
-        let b = async {
-            read_to_write(stream_read, client_write, "write".to_string())
+        let b = async move {
+            read_to_write(stream_read, client_write)
                 .await
                 .unwrap();
         };
@@ -38,22 +36,17 @@ async fn main() -> std::io::Result<()> {
             _ = b => {}
         };
     }
-
-    Ok(())
 }
 
-async fn read_to_write(
-    mut read: OwnedReadHalf,
-    mut write: OwnedWriteHalf,
-    str: String,
-) -> std::io::Result<()> {
+async fn read_to_write<R, W>(mut reader: R, mut writer: W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
-        println!("run {str}");
         let mut buf = [0u8; 4096];
 
-        let n = read.read(&mut buf).await?;
-
-        println!("{n} {str}");
+        let n = reader.read(&mut buf).await?;
 
         if n == 0 {
             break;
@@ -61,7 +54,7 @@ async fn read_to_write(
 
         let data = &buf[..n];
 
-        write.write(&data).await?;
+        writer.write(&data).await?;
     }
 
     Ok(())
