@@ -1,11 +1,14 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand, command};
+use clap::{Parser, Subcommand};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split}, net::{
         TcpListener, TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf},
     },
 };
 use tokio_socks::tcp::Socks5Stream;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::collections::HashMap;
 
 #[derive(Parser)]
 #[command(name = "mode")]
@@ -50,37 +53,52 @@ async fn main() -> Result<()> {
         }
     }
 
+    let (ssh_1_read, ssh_1_write) = ssh_1_stream.into_split();
+    let (ssh_2_read, ssh_2_write) = ssh_2_stream.into_split();
+
+    let arc_ssh_1_writer = Arc::new(Mutex::new(ssh_1_write));
+    let arc_ssh_2_writer = Arc::new(Mutex::new(ssh_2_write));
+
     if let Commands::Client { listener } = &cli.command {
         let mut connections: u8 = 0;
+        let mut writes_map: HashMap<u8, OwnedWriteHalf> = HashMap::new();
 
         let listener = TcpListener::bind(listener).await?;
 
         loop {
             let client_stream = listener.accept().await?.0;
 
-            let (client_read, client_write) = client_stream.into_split();
-            let (ssh_1_read, ssh_1_write) = &ssh_1_stream.into_split();
-            let (ssh_2_read, ssh_2_write) = &ssh_2_stream.into_split();
+            let (reader, writer) = client_stream.into_split();
 
+            tokio::spawn(reader_to_writers(reader, arc_ssh_1_writer.clone(), arc_ssh_2_writer.clone(), connections));
 
-            tokio::spawn(rider_to_writers(client_read, ssh_1_write, ssh_2_write));
-            tokio::spawn(writers_to_reader(ssh_1_read, ssh_2_read, client_write));
+            writes_map.insert(connections, writer);
+
+            connections += 1;
         }
     }
 
     Ok(())
 }
 
-async fn rider_to_writers(reader: OwnedReadHalf, writer1: &OwnedWriteHalf, writter2: &OwnedWriteHalf) -> Result<()>
-{
-    
+async fn reader_to_writers(mut reader: OwnedReadHalf, mut writer1: Arc<Mutex<OwnedWriteHalf>>, mut writer2: Arc<Mutex<OwnedWriteHalf>>, connection_id: u8) -> Result<()>{
+    let mut buf = [0u8;  1024];
 
-    Ok(())
-}
+    loop {
+        let n = reader.read(&mut buf).await?;
 
-async fn writers_to_reader(reader1: &OwnedReadHalf, reader2: &OwnedReadHalf, writter: OwnedWriteHalf) -> Result<()>
-{
-    
+        if n == 0 {
+            break;
+        }
+
+        let mut w1 = writer1.lock().await;
+
+        w1.write(&buf[..n]).await?;
+
+        let mut w2 = writer2.lock().await;
+
+        w2.write(&buf[..n]).await?;
+    }
 
     Ok(())
 }
