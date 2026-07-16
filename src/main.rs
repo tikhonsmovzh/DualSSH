@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
             let (ssh_1_read, ssh_1_write) = &ssh_1_stream.into_split();
             let (ssh_2_read, ssh_2_write) = &ssh_2_stream.into_split();
 
+
             tokio::spawn(rider_to_writers(client_read, ssh_1_write, ssh_2_write));
             tokio::spawn(writers_to_reader(ssh_1_read, ssh_2_read, client_write));
         }
@@ -70,14 +71,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn rider_to_writers(reader: OwnedReadHalf, writer1: OwnedWriteHalf, writter2: OwnedWriteHalf) -> Result<()>
+async fn rider_to_writers(reader: OwnedReadHalf, writer1: &OwnedWriteHalf, writter2: &OwnedWriteHalf) -> Result<()>
 {
     
 
     Ok(())
 }
 
-async fn writers_to_reader(reader1: OwnedReadHalf, reader2: OwnedReadHalf, writter: OwnedWriteHalf) -> Result<()>
+async fn writers_to_reader(reader1: &OwnedReadHalf, reader2: &OwnedReadHalf, writter: OwnedWriteHalf) -> Result<()>
 {
     
 
