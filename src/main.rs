@@ -2,6 +2,7 @@ use anyhow::{Error, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
             ssh_1_stream = Socks5Stream::connect("127.0.0.1:1080", "127.0.0.1:7878")
                 .await?
                 .into_inner();
+
             ssh_2_stream = Socks5Stream::connect("127.0.0.1:1085", "127.0.0.1:7078")
                 .await?
                 .into_inner();
@@ -76,6 +78,8 @@ async fn main() -> Result<()> {
 
             let writes_map_copy = writes_map.clone();
             let readers_map_copy = readers_map.clone();
+
+            let global_packet_counter = Arc::new(AtomicU8::new(0));
 
             tokio::spawn(async move {
                 let listener = TcpListener::bind(listener).await.unwrap();
@@ -111,6 +115,7 @@ async fn main() -> Result<()> {
                             arc_ssh_1_writer.clone(),
                             arc_ssh_2_writer.clone(),
                             connection,
+                            global_packet_counter.clone(),
                             async move {
                                 writes_map_copy_1.lock().await.remove(&connection);
                                 readers_map_copy_1.lock().await.remove(&connection);
@@ -132,16 +137,16 @@ async fn main() -> Result<()> {
                 let r2 = ssh_2_read.read_exact(&mut buf2[0..4]);
 
                 let buf: &mut [u8; BUF_SIZE];
-                let reader: &mut OwnedReadHalf;
+                let ssh_reader: &mut OwnedReadHalf;
 
                 tokio::select! {
                     _ = r1 => {
                         buf = &mut buf1;
-                        reader = &mut ssh_1_read;
+                        ssh_reader = &mut ssh_1_read;
                     }
                     _ = r2 => {
                         buf = &mut buf2;
-                        reader = &mut ssh_2_read;
+                        ssh_reader = &mut ssh_2_read;
                     }
                 }
 
@@ -149,17 +154,7 @@ async fn main() -> Result<()> {
 
                 let connection = buf[0];
 
-                if packet != 0 {
-                    let dif = packet - current_packet;
-
-                    if dif > 0 && dif < 20 {
-                        current_packet = packet;
-                        current_packet %= 255;
-                    } else {
-                        continue;
-                    }
-                }
-                else {
+                if packet == 0 {
                     writes_map.lock().await.remove(&connection);
 
                     let mut readers_map_mut = readers_map.lock().await;
@@ -177,7 +172,16 @@ async fn main() -> Result<()> {
 
                 let data_size = u16::from_be_bytes(buf[2..4].try_into()?) as usize;
 
-                reader.read_exact(&mut buf[4..(data_size + 4)]).await?;
+                ssh_reader.read_exact(&mut buf[4..(data_size + 4)]).await?;
+
+                let dif = packet - current_packet;
+
+                if dif > 0 && dif < 20 {
+                    current_packet = packet;
+                    current_packet %= 255;
+                } else {
+                    continue;
+                }
 
                 writes_map
                     .lock()
@@ -201,21 +205,23 @@ async fn main() -> Result<()> {
 
             let mut current_packet = 0;
 
+            let global_packet_counter = Arc::new(AtomicU8::new(0));
+
             loop {
                 let r1 = ssh_1_read.read_exact(&mut buf1[0..4]);
                 let r2 = ssh_2_read.read_exact(&mut buf2[0..4]);
 
                 let buf: &mut [u8; BUF_SIZE];
-                let reader: &mut OwnedReadHalf;
+                let ssh_reader: &mut OwnedReadHalf;
 
                 tokio::select! {
                     _ = r1 => {
                         buf = &mut buf1;
-                        reader = &mut ssh_1_read;
+                        ssh_reader = &mut ssh_1_read;
                     }
                     _ = r2 => {
                         buf = &mut buf2;
-                        reader = &mut ssh_2_read;
+                        ssh_reader = &mut ssh_2_read;
                     }
                 }
 
@@ -223,16 +229,7 @@ async fn main() -> Result<()> {
 
                 let connection = buf[0];
 
-                if packet != 0 {
-                    let dif = packet - current_packet;
-
-                    if dif > 0 && dif < 20 {
-                        current_packet = packet;
-                        current_packet %= 255;
-                    } else {
-                        continue;
-                    }
-                } else {
+                if packet == 0 {
                     writes_map.lock().await.remove(&connection);
 
                     let mut readers_map = readers_map.lock().await;
@@ -243,6 +240,19 @@ async fn main() -> Result<()> {
                     }
 
                     println!("remove connection id {}", connection);
+
+                    continue;
+                }
+
+                let data_size = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+
+                let dif = packet - current_packet;
+
+                if dif > 0 && dif < 20 {
+                    current_packet = packet;
+                    current_packet %= 255;
+                } else {
+                    ssh_reader.read_exact(&mut buf[4..(data_size + 4)]).await?;
 
                     continue;
                 }
@@ -280,6 +290,7 @@ async fn main() -> Result<()> {
                             arc_ssh_1_writer.clone(),
                             arc_ssh_2_writer.clone(),
                             connection,
+                            global_packet_counter.clone(),
                             async move {
                                 writers_map_copy.lock().await.remove(&connection);
                                 readers_map_copy.lock().await.remove(&connection);
@@ -292,9 +303,7 @@ async fn main() -> Result<()> {
                     writes_map.lock().await.insert(connection, writer);
                 }
 
-                let data_size = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-
-                reader.read_exact(&mut buf[4..(data_size + 4)]).await?;
+                ssh_reader.read_exact(&mut buf[4..(data_size + 4)]).await?;
 
                 writes_map
                     .lock()
@@ -313,13 +322,13 @@ async fn reader_to_writers<F>(
     writer1: Arc<Mutex<OwnedWriteHalf>>,
     writer2: Arc<Mutex<OwnedWriteHalf>>,
     connection_id: u8,
+    packet_counter: Arc<AtomicU8>,
     on_connection_close: F,
 ) -> Result<()>
 where
     F: Future,
 {
     let mut buf = [1u8; BUF_SIZE];
-    let mut packet_counter = 0;
 
     loop {
         let n: u16 = reader.read(&mut buf[4..(BUF_SIZE)]).await? as u16;
@@ -344,9 +353,9 @@ where
         buf[2] = nb[0];
         buf[3] = nb[1];
 
-        packet_counter %= 255;
-        packet_counter += 1;
-        buf[1] = packet_counter;
+        let _ = packet_counter.try_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x % 255));
+        packet_counter.fetch_add(1, Ordering::SeqCst);
+        buf[1] = packet_counter.load(Ordering::SeqCst);
 
         writer1
             .lock()
